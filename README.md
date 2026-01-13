@@ -14,12 +14,16 @@
 
 
 ## Usage
+```
 sudo -u <user> gcsfuse -o nonempty -file-mode=777 -dir-mode=777 --debug_gcs <gcs.url.com> ~/dev_gcs_lower
 ./posixlite -lower ~/dev_gcs_lower -mount ~/dev
+```
 
 Unmount:
 - Ctrl+C
-- fusermount -uz ~/dev
+- ```fusermount -uz ~/dev```
 
 ## Build
+```
 go build -o posixlite posixlite.go
+```
