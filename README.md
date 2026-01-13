@@ -27,3 +27,9 @@ Unmount:
 ```
 go build -o posixlite posixlite.go
 ```
+
+## Notes
+Vibecoded with brain :)
+
+## Author
+Michal Zygmunt
