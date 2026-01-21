@@ -6,7 +6,7 @@
 // - Persists chmod/chown by saving metadata JSON files under Lower/.posixmeta/
 //
 // Build:  go build -o posixlite posixlite.go
-// Run:    ./posixlite -lower ~/dev_gcs_lower -mount ~/dev2
+// Run:    ./posixlite -lower ~/dev_gcs_lower -mount ~/dev -logfile ~/posixlite.log
 //
 // Notes:
 // - Intentionally minimal. Good enough for chmod +x persistence.
@@ -55,11 +55,23 @@ func main() {
 	mount := flag.String("mount", "", "Mount point for FUSE")
 	defFile := flag.String("def-file-mode", "0666", "Default file mode (octal) when no metadata exists")
 	defDir := flag.String("def-dir-mode", "0777", "Default dir mode (octal) when no metadata exists")
+	debug := flag.Bool("debug", false, "Enable verbose FUSE debug logging")
+	logfile := flag.String("logfile", "", "Write logs to this file (in addition to stderr)")
 	flag.Parse()
 
 	if *lower == "" || *mount == "" {
-		log.Fatalf("Usage: %s -lower <dir> -mount <dir>", os.Args[0])
+		log.Fatalf("Usage: %s -lower <dir> -mount <dir> [-debug] [-logfile <path>]", os.Args[0])
 	}
+
+	// Optional file logging
+	if *logfile != "" {
+		f, err := os.OpenFile(*logfile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
+		if err != nil {
+			log.Fatalf("failed to open logfile %s: %v", *logfile, err)
+		}
+		log.SetOutput(io.MultiWriter(os.Stderr, f))
+	}
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	dfm, err := parseOctalMode(*defFile)
 	if err != nil {
@@ -73,32 +85,33 @@ func main() {
 	lowerAbs, _ := filepath.Abs(*lower)
 	mountAbs, _ := filepath.Abs(*mount)
 
-	// Create mountpoint if needed
 	if err := os.MkdirAll(mountAbs, 0o777); err != nil {
 		log.Fatalf("failed to create mount dir %s: %v", mountAbs, err)
 	}
 
-	// Metadata directory lives in the lower tree (persisted in GCS via gcsfuse)
 	metaDir := filepath.Join(lowerAbs, ".posixmeta")
 	if err := os.MkdirAll(metaDir, 0o777); err != nil {
 		log.Fatalf("failed to create metadata dir %s: %v", metaDir, err)
 	}
 
-	// --- Self-heal: clean up stale mounts from previous crash/kill -9 ---
-	// Best-effort unmount (ignore errors if not mounted)
+	// Best-effort stale mount cleanup (helps after kill -9)
 	_ = fuse.Unmount(mountAbs)
-
-	// In Cloud Shell it's common for stale mounts to require a "lazy" unmount.
-	// We do this best-effort; if fusermount isn't present, it just fails silently.
-	// NOTE: this is optional but helps a lot after SIGKILL.
 	_ = exec.Command("fusermount", "-uz", mountAbs).Run()
 	_ = exec.Command("fusermount3", "-uz", mountAbs).Run()
 
-	// --- Install signal handling (Ctrl+C, SIGTERM, SIGHUP) ---
+	// Signals
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
-	// Mount with conservative options compatible across bazil.org/fuse versions
+	// Enable bazil FUSE debug output (package-level hook in this version)
+	if *debug {
+		fuse.Debug = func(msg interface{}) {
+			log.Printf("FUSE %v", msg)
+		}
+	}
+
+	log.Printf("Starting posixlite lower=%s mount=%s meta=%s debug=%v", lowerAbs, mountAbs, metaDir, *debug)
+
 	c, err := fuse.Mount(
 		mountAbs,
 		fuse.FSName("posixlite"),
@@ -120,39 +133,52 @@ func main() {
 		serveErr <- fs.Serve(c, fsys)
 	}()
 
-	// Wait for either a signal or Serve() finishing with error
 	select {
 	case <-ctx.Done():
-		// Shutdown path: unmount + close conn so Serve() unblocks
+		log.Printf("Signal received, unmounting...")
 		_ = fuse.Unmount(mountAbs)
 		_ = c.Close()
-
-		// If unmount is still stuck (open files), attempt lazy unmount as a last resort
 		time.Sleep(200 * time.Millisecond)
 		_ = exec.Command("fusermount", "-uz", mountAbs).Run()
 		_ = exec.Command("fusermount3", "-uz", mountAbs).Run()
-
-		// Drain serve error if it returns
-		select {
-		case err := <-serveErr:
-			if err != nil && err != io.EOF {
-				log.Printf("fs.Serve returned: %v", err)
-			}
-		default:
-		}
-
+		log.Printf("Exiting.")
 	case err := <-serveErr:
-		// Serve finished (usually means mount went away or an error occurred)
-		if err != nil && err != io.EOF {
-			log.Printf("fs.Serve error: %v", err)
-		}
+		log.Printf("fs.Serve returned: %v", err)
 		_ = c.Close()
 	}
+}
 
-	// Final best-effort unmount on exit
-	_ = fuse.Unmount(mountAbs)
-	_ = exec.Command("fusermount", "-uz", mountAbs).Run()
-	_ = exec.Command("fusermount3", "-uz", mountAbs).Run()
+func (d *dirNode) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error) {
+	childRel := joinRel(d.rel, req.Name)
+	lp := filepath.Join(d.o.lower, childRel)
+
+	// Only support regular files in this minimal overlay
+	if (req.Mode & os.ModeType) != 0 {
+		log.Printf("Mknod unsupported type rel=%q mode=%#o", childRel, req.Mode)
+		return nil, fuse.ENOSYS
+	}
+
+	// Create the file (O_EXCL avoids clobber if it exists)
+	f, err := os.OpenFile(lp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, req.Mode)
+	if err != nil {
+		// If already exists, just return the node
+		if os.IsExist(err) {
+			return &fileNode{o: d.o, rel: childRel}, nil
+		}
+		log.Printf("Mknod FAILED rel=%q lower=%q mode=%#o err=%v", childRel, lp, req.Mode, err)
+		return nil, err
+	}
+	_ = f.Close()
+
+	// Persist perms (best-effort)
+	d.o.setMeta(childRel, meta{
+		Mode: uint32(req.Mode & os.ModePerm),
+		UID:  uint32(os.Getuid()),
+		GID:  uint32(os.Getgid()),
+	})
+
+	log.Printf("Mknod OK rel=%q lower=%q mode=%#o", childRel, lp, req.Mode)
+	return &fileNode{o: d.o, rel: childRel}, nil
 }
 
 // --- FS root ---
@@ -175,8 +201,13 @@ func (d *dirNode) lowerPath() string {
 func (d *dirNode) Attr(ctx context.Context, a *fuse.Attr) error {
 	st, err := os.Lstat(d.lowerPath())
 	if err != nil {
+		if os.IsNotExist(err) {
+			return fuse.ENOENT
+		}
+		log.Printf("Dir Attr FAILED rel=%q lower=%q err=%v", d.rel, d.lowerPath(), err)
 		return err
 	}
+
 	fillAttrFromInfo(st, a)
 
 	if md, ok := d.o.getMeta(d.rel); ok {
@@ -189,16 +220,31 @@ func (d *dirNode) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
+func (h *fileHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	if err := h.f.Sync(); err != nil {
+		log.Printf("Fsync FAILED rel=%q err=%v", h.rel, err)
+		return err
+	}
+	return nil
+}
+
 func (d *dirNode) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	if name == ".posixmeta" {
 		return nil, fuse.ENOENT
 	}
+
 	childRel := joinRel(d.rel, name)
 	lp := filepath.Join(d.o.lower, childRel)
+
 	st, err := os.Lstat(lp)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fuse.ENOENT
+		}
+		log.Printf("Lookup FAILED rel=%q lower=%q err=%v", childRel, lp, err)
 		return nil, err
 	}
+
 	if st.IsDir() {
 		return &dirNode{o: d.o, rel: childRel}, nil
 	}
@@ -246,10 +292,23 @@ func (d *dirNode) Create(ctx context.Context, req *fuse.CreateRequest, resp *fus
 	childRel := joinRel(d.rel, req.Name)
 	lp := filepath.Join(d.o.lower, childRel)
 
-	f, err := os.OpenFile(lp, os.O_CREATE|os.O_RDWR|os.O_TRUNC, req.Mode)
+	// Keep create simple: gcsfuse/object-store FUSE layers can reject exotic combinations.
+	flags := os.O_WRONLY | os.O_CREATE
+	if req.Flags&fuse.OpenTruncate != 0 {
+		flags |= os.O_TRUNC
+	}
+	if req.Flags&fuse.OpenAppend != 0 {
+		flags |= os.O_APPEND
+	}
+
+	f, err := os.OpenFile(lp, flags, req.Mode)
 	if err != nil {
+		log.Printf("Create FAILED rel=%q lower=%q reqFlags=%v oflags=%#x mode=%#o err=%v",
+			childRel, lp, req.Flags, flags, req.Mode, err)
 		return nil, nil, err
 	}
+
+	// Persist perms (best-effort; if metadata write fails we still keep the file)
 	d.o.setMeta(childRel, meta{
 		Mode: uint32(req.Mode & os.ModePerm),
 		UID:  uint32(os.Getuid()),
@@ -257,7 +316,12 @@ func (d *dirNode) Create(ctx context.Context, req *fuse.CreateRequest, resp *fus
 	})
 
 	n := &fileNode{o: d.o, rel: childRel}
-	h := &fileHandle{f: f, rel: childRel, o: d.o}
+	h := &fileHandle{
+		f:      f,
+		rel:    childRel,
+		o:      d.o,
+		append: (flags&os.O_APPEND != 0),
+	}
 	return n, h, nil
 }
 
@@ -309,8 +373,13 @@ func (f *fileNode) lowerPath() string {
 func (f *fileNode) Attr(ctx context.Context, a *fuse.Attr) error {
 	st, err := os.Lstat(f.lowerPath())
 	if err != nil {
+		if os.IsNotExist(err) {
+			return fuse.ENOENT
+		}
+		log.Printf("File Attr FAILED rel=%q lower=%q err=%v", f.rel, f.lowerPath(), err)
 		return err
 	}
+
 	fillAttrFromInfo(st, a)
 
 	if md, ok := f.o.getMeta(f.rel); ok {
@@ -324,12 +393,19 @@ func (f *fileNode) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (f *fileNode) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
-	flags := openFlags(req.Flags)
-	of, err := os.OpenFile(f.lowerPath(), flags, 0)
+	oflags := openFlags(req.Flags)
+	of, err := os.OpenFile(f.lowerPath(), oflags, 0)
 	if err != nil {
+		log.Printf("Open FAILED rel=%q lower=%q reqFlags=%v oflags=%#x err=%v",
+			f.rel, f.lowerPath(), req.Flags, oflags, err)
 		return nil, err
 	}
-	return &fileHandle{f: of, rel: f.rel, o: f.o}, nil
+	return &fileHandle{
+		f:      of,
+		rel:    f.rel,
+		o:      f.o,
+		append: (oflags&os.O_APPEND != 0),
+	}, nil
 }
 
 func (f *fileNode) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
@@ -358,7 +434,12 @@ func (f *fileNode) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *
 		if req.Valid.Mtime() {
 			mt = req.Mtime
 		}
-		_ = os.Chtimes(f.lowerPath(), at, mt)
+
+		if err := os.Chtimes(f.lowerPath(), at, mt); err != nil {
+			log.Printf("Setattr Chtimes ignored rel=%q err=%v", f.rel, err)
+			// do NOT return err
+		}
+		//_ = os.Chtimes(f.lowerPath(), at, mt)
 	}
 
 	return f.Attr(ctx, &resp.Attr)
@@ -367,15 +448,22 @@ func (f *fileNode) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *
 // --- file handle ---
 
 type fileHandle struct {
-	f   *os.File
-	rel string
-	o   *overlayFS
+	f      *os.File
+	rel    string
+	o      *overlayFS
+	append bool
 }
 
 func (h *fileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	// Sequential read: seek then read
+	if _, err := h.f.Seek(req.Offset, io.SeekStart); err != nil {
+		log.Printf("Read Seek FAILED rel=%q off=%d err=%v", h.rel, req.Offset, err)
+		return err
+	}
 	buf := make([]byte, req.Size)
-	n, err := h.f.ReadAt(buf, req.Offset)
+	n, err := h.f.Read(buf)
 	if err != nil && err != io.EOF {
+		log.Printf("Read FAILED rel=%q off=%d size=%d err=%v", h.rel, req.Offset, req.Size, err)
 		return err
 	}
 	resp.Data = buf[:n]
@@ -383,8 +471,19 @@ func (h *fileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse
 }
 
 func (h *fileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	n, err := h.f.WriteAt(req.Data, req.Offset)
+	// If file opened with O_APPEND, ignore req.Offset and just Write.
+	// This is REQUIRED for ">>" redirection semantics to work reliably.
+	if !h.append {
+		if _, err := h.f.Seek(req.Offset, io.SeekStart); err != nil {
+			log.Printf("Write Seek FAILED rel=%q off=%d err=%v", h.rel, req.Offset, err)
+			return err
+		}
+	}
+
+	n, err := h.f.Write(req.Data)
 	if err != nil {
+		log.Printf("Write FAILED rel=%q append=%v off=%d len=%d err=%v",
+			h.rel, h.append, req.Offset, len(req.Data), err)
 		return err
 	}
 	resp.Size = n
@@ -429,9 +528,12 @@ func (o *overlayFS) setMeta(rel string, md meta) {
 	_ = os.MkdirAll(o.metaDir, 0o777)
 
 	b, _ := json.Marshal(md)
-	tmp := o.metaPath(rel) + ".tmp"
-	_ = os.WriteFile(tmp, b, 0o666)
-	_ = os.Rename(tmp, o.metaPath(rel))
+
+	// Write directly (no rename) for compatibility with gcsfuse/object-store semantics.
+	if err := os.WriteFile(o.metaPath(rel), b, 0o666); err != nil {
+		log.Printf("setMeta FAILED rel=%q meta=%q err=%v", rel, o.metaPath(rel), err)
+		// best-effort: do not fail the filesystem operation because metadata failed
+	}
 }
 
 func (o *overlayFS) delMeta(rel string) {
@@ -460,16 +562,31 @@ func parseOctalMode(s string) (os.FileMode, error) {
 }
 
 func openFlags(ff fuse.OpenFlags) int {
+	flags := 0
+
+	// access mode
 	switch ff & fuse.OpenAccessModeMask {
 	case fuse.OpenReadOnly:
-		return os.O_RDONLY
+		flags |= os.O_RDONLY
 	case fuse.OpenWriteOnly:
-		return os.O_WRONLY
+		flags |= os.O_WRONLY
 	case fuse.OpenReadWrite:
-		return os.O_RDWR
+		flags |= os.O_RDWR
 	default:
-		return os.O_RDONLY
+		flags |= os.O_RDONLY
 	}
+
+	// common modifiers
+	if ff&fuse.OpenAppend != 0 {
+		flags |= os.O_APPEND
+	}
+	if ff&fuse.OpenTruncate != 0 {
+		flags |= os.O_TRUNC
+	}
+
+	// NOTE: we intentionally do not try to map every Linux open(2) flag here.
+	// gcsfuse can be sensitive; keeping it minimal improves compatibility.
+	return flags
 }
 
 func fillAttrFromInfo(fi os.FileInfo, a *fuse.Attr) {
