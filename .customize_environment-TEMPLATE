@@ -1,0 +1,8 @@
+#!/bin/sh
+sleep 10
+#sudo -u lahcim gcsfuse -o nonempty -file-mode=777 -dir-mode=777 --debug_gcs environment.dev.fajne.com ~lahcim/dev_gcs_lower
+#sudo -u lahcim ~lahcim/posixlite/posixlite -lower ~/dev_gcs_lower -mount ~/dev &
+
+sudo -u lahcim /usr/bin/bash -lc 'mkdir -p ~/bin; [ -x ~/bin/fusermount3 ] || { printf "%s\n" "#!/bin/sh" "exec /usr/bin/fusermount \"\$@\"" > ~/bin/fusermount3; chmod +x ~/bin/fusermount3; }'
+sudo -u lahcim gcsfuse -o nonempty -file-mode=777 -dir-mode=777 --debug_gcs environment.dev.fajne.com ~lahcim/dev_gcs_lower
+sudo -u lahcim /usr/bin/bash -lc 'PATH="$HOME/bin:/usr/bin:/bin" ~/posixlite/posixlite -lower ~/dev_gcs_lower -mount ~/dev'
