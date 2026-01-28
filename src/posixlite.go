@@ -7,6 +7,7 @@
 //
 // Build:  go build -o posixlite posixlite.go
 // Run:    ./posixlite -lower ~/dev_gcs_lower -mount ~/dev -logfile ~/posixlite.log
+// Unmount: fusermount -u ~/dev
 //
 // Notes:
 // - Intentionally minimal. Good enough for chmod +x persistence.
@@ -57,11 +58,15 @@ func main() {
 	defDir := flag.String("def-dir-mode", "0777", "Default dir mode (octal) when no metadata exists")
 	debug := flag.Bool("debug", false, "Enable verbose FUSE debug logging")
 	logfile := flag.String("logfile", "", "Write logs to this file (in addition to stderr)")
+	daemon := flag.Bool("daemon", true, "Run in background (daemonize) and return immediately")
+
 	flag.Parse()
 
 	if *lower == "" || *mount == "" {
 		log.Fatalf("Usage: %s -lower <dir> -mount <dir> [-debug] [-logfile <path>]", os.Args[0])
 	}
+
+	maybeDaemonize(*daemon, *logfile)
 
 	// Optional file logging
 	if *logfile != "" {
@@ -146,6 +151,46 @@ func main() {
 		log.Printf("fs.Serve returned: %v", err)
 		_ = c.Close()
 	}
+}
+
+func maybeDaemonize(daemon bool, logfile string) {
+	// If not requested, or we're already the daemon child, do nothing.
+	if !daemon || os.Getenv("POSIXLITE_DAEMON") == "1" {
+		return
+	}
+
+	// Re-exec self as a new session leader (detached from the terminal).
+	cmd := exec.Command(os.Args[0], os.Args[1:]...)
+	cmd.Env = append(os.Environ(), "POSIXLITE_DAEMON=1")
+
+	// Detach from controlling terminal.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	// Redirect stdio:
+	// - If logfile is provided, keep stderr/stdout there.
+	// - Otherwise discard to /dev/null.
+	var out *os.File
+	var err error
+	if logfile != "" {
+		out, err = os.OpenFile(logfile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
+		if err != nil {
+			// If we can't open logfile, fall back to /dev/null.
+			out, _ = os.OpenFile("/dev/null", os.O_WRONLY, 0)
+		}
+	} else {
+		out, _ = os.OpenFile("/dev/null", os.O_WRONLY, 0)
+	}
+	in, _ := os.OpenFile("/dev/null", os.O_RDONLY, 0)
+	cmd.Stdin = in
+	cmd.Stdout = out
+	cmd.Stderr = out
+
+	// Start child and exit parent immediately.
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("failed to daemonize: %v", err)
+	}
+	fmt.Printf("posixlite started in background (pid %d)\n", cmd.Process.Pid)
+	os.Exit(0)
 }
 
 func (d *dirNode) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error) {
