@@ -78,6 +78,8 @@ func main() {
 	}
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	log.SetPrefix(fmt.Sprintf("[pid=%d] ", os.Getpid()))
+
 	dfm, err := parseOctalMode(*defFile)
 	if err != nil {
 		log.Fatalf("bad -def-file-mode: %v", err)
@@ -266,10 +268,22 @@ func (d *dirNode) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (h *fileHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	log.Printf("Fsync rel=%q", h.rel)
+
 	if err := h.f.Sync(); err != nil {
-		log.Printf("Fsync FAILED rel=%q err=%v", h.rel, err)
-		return err
+		log.Printf("File Fsync ignored rel=%q err=%v", h.rel, err)
 	}
+	return nil
+}
+
+func (f *fileNode) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	// Best-effort: ignore fsync failures in object-store/FUSE stacks.
+	log.Printf("NodeFsync(file) rel=%q", f.rel)
+	return nil
+}
+
+func (d *dirNode) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	log.Printf("NodeFsync(dir) rel=%q", d.rel)
 	return nil
 }
 
@@ -437,6 +451,72 @@ func (f *fileNode) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
+func (d *dirNode) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	lp := d.lowerPath()
+
+	f, err := os.Open(lp)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fuse.ENOENT
+		}
+		log.Printf("Dir Open FAILED rel=%q lower=%q err=%v", d.rel, lp, err)
+		return nil, err
+	}
+
+	return &dirHandle{f: f, rel: d.rel, lowerDir: lp}, nil
+}
+
+func (h *dirHandle) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	entries, err := os.ReadDir(h.lowerDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fuse.ENOENT
+		}
+		log.Printf("Dir ReadDirAll FAILED rel=%q lower=%q err=%v", h.rel, h.lowerDir, err)
+		return nil, err
+	}
+
+	out := make([]fuse.Dirent, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if name == ".posixmeta" {
+			continue
+		}
+		var t fuse.DirentType
+		if e.IsDir() {
+			t = fuse.DT_Dir
+		} else {
+			t = fuse.DT_File
+		}
+		out = append(out, fuse.Dirent{Name: name, Type: t})
+	}
+	return out, nil
+}
+
+func (h *dirHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	log.Printf("Fsync rel=%q", h.rel)
+
+	if err := h.f.Sync(); err != nil {
+		log.Printf("Dir Fsync ignored rel=%q err=%v", h.rel, err)
+	}
+	return nil
+}
+
+func (h *dirHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
+	if err := h.f.Sync(); err != nil {
+		log.Printf("Dir Flush ignored rel=%q err=%v", h.rel, err)
+	}
+	return nil
+}
+
+func (h *dirHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	if err := h.f.Close(); err != nil {
+		log.Printf("Dir Release(close) ignored rel=%q err=%v", h.rel, err)
+		return nil
+	}
+	return nil
+}
+
 func (f *fileNode) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	oflags := openFlags(req.Flags)
 	of, err := os.OpenFile(f.lowerPath(), oflags, 0)
@@ -499,6 +579,19 @@ type fileHandle struct {
 	append bool
 }
 
+type dirHandle struct {
+	f        *os.File
+	rel      string
+	lowerDir string
+}
+
+func (h *fileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
+	if err := h.f.Sync(); err != nil {
+		log.Printf("File Flush ignored rel=%q err=%v", h.rel, err)
+	}
+	return nil
+}
+
 func (h *fileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 	// Sequential read: seek then read
 	if _, err := h.f.Seek(req.Offset, io.SeekStart); err != nil {
@@ -535,12 +628,14 @@ func (h *fileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fu
 	return nil
 }
 
-func (h *fileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
-	return h.f.Sync()
-}
-
 func (h *fileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
-	return h.f.Close()
+	if err := h.f.Close(); err != nil {
+		// Editors may treat close() errors as fsync/write failure.
+		// On object-store/FUSE stacks this can happen; ignore to allow saves.
+		log.Printf("File Release(close) ignored rel=%q err=%v", h.rel, err)
+		return nil
+	}
+	return nil
 }
 
 // --- metadata storage ---
